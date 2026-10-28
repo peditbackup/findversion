@@ -36,6 +36,7 @@ jobs:
           PACKAGE_DEF = re.compile(r"^\s*define\s+Package/([^\s/]+)\s*$", re.MULTILINE)
           KERNEL_DEF = re.compile(r"^\s*define\s+KernelPackage/([^\s/]+)\s*$", re.MULTILINE)
           BUILD_PACKAGE = re.compile(r"\$\(call\s+BuildPackage,([^\s)]+)\)")
+          COREUTILS_APPLETS_DEF = re.compile(r"^\s*COREUTILS_APPLETS\s*[:+?]?=\s*(.*)$")
           LUCI_PACKAGE_GROUPS = {"applications", "collections", "libs", "modules", "plugins", "protocols", "themes"}
 
           def request(url, accept="application/vnd.github+json"):
@@ -88,9 +89,22 @@ jobs:
                   makefiles.add(("openwrt/openwrt", path))
               if path.endswith(".mk") and (
                   path.startswith("package/kernel/linux/modules/")
-                  or (path.startswith("target/linux/") and "/modules/" in path)
+                  or path.startswith("target/linux/")
               ):
                   makefiles.add(("openwrt/openwrt", path))
+
+          def get_make_variable_words(source, variable_pattern):
+              lines = source.splitlines()
+              for index, line in enumerate(lines):
+                  match = variable_pattern.match(line)
+                  if not match:
+                      continue
+                  value = match.group(1).strip()
+                  while value.rstrip().endswith("\\") and index + 1 < len(lines):
+                      value = value.rstrip()[:-1] + " " + lines[index + 1].strip()
+                      index += 1
+                  return value.split()
+              return []
 
           def fetch_makefile(item):
               repository, path = item
@@ -120,6 +134,8 @@ jobs:
                   for name in KERNEL_DEF.findall(source):
                       if "$" not in name:
                           packages.add(f"kmod-{name}")
+                  if repository == "openwrt/packages" and path == "utils/coreutils/Makefile":
+                      packages.update(f"coreutils-{applet}" for applet in get_make_variable_words(source, COREUTILS_APPLETS_DEF))
 
           packages = sorted(name for name in packages if name and not name.startswith("."))
           if len(packages) < 1000:
