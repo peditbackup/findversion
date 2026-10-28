@@ -2,8 +2,8 @@ name: Update OpenWrt Packages List
 
 on:
   schedule:
-    - cron: '0 3 1 */6 *' # January and July, on the 1st at 03:00 UTC
-  workflow_dispatch:
+    - cron: '0 3 1 */6 *'  # Every 6 months on the 1st at 3 AM UTC
+  workflow_dispatch:  # Manual trigger
 
 permissions:
   contents: write
@@ -14,71 +14,135 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Fetch OpenWrt package directories
-        shell: bash
+      - name: Generate complete OpenWrt package index
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          set -euo pipefail
+          python3 <<'PY'
+          import concurrent.futures
+          import json
+          import os
+          import re
+          import urllib.parse
+          import urllib.request
+          from datetime import datetime, timezone
 
-          curl -fsSL "https://api.github.com/repos/openwrt/packages/git/trees/master?recursive=1" \
-            -o /tmp/packages-tree.json
-          curl -fsSL "https://api.github.com/repos/openwrt/luci/git/trees/master?recursive=1" \
-            -o /tmp/luci-tree.json
+          API_ROOT = "https://api.github.com/repos"
+          RAW_ROOT = "https://raw.githubusercontent.com"
+          REPOSITORIES = ("openwrt/packages", "openwrt/luci", "openwrt/openwrt")
+          PACKAGE_DEF = re.compile(r"^\s*define\s+Package/([^\s/]+)\s*$", re.MULTILINE)
+          KERNEL_DEF = re.compile(r"^\s*define\s+KernelPackage/([^\s/]+)\s*$", re.MULTILINE)
+          BUILD_PACKAGE = re.compile(r"\$\(call\s+BuildPackage,([^\s)]+)\)")
+          LUCI_PACKAGE_GROUPS = {"applications", "collections", "libs", "modules", "plugins", "protocols", "themes"}
 
-          # GitHub can truncate large recursive trees; fail instead of writing a partial list.
-          if jq -e '.truncated == true' /tmp/packages-tree.json >/dev/null || \
-             jq -e '.truncated == true' /tmp/luci-tree.json >/dev/null; then
-            echo "GitHub returned a truncated repository tree." >&2
-            exit 1
-          fi
+          def request(url, accept="application/vnd.github+json"):
+              headers = {"Accept": accept, "User-Agent": "openwrt-package-index-workflow"}
+              token = os.environ.get("GH_TOKEN")
+              if token and urllib.parse.urlparse(url).netloc == "api.github.com":
+                  headers["Authorization"] = f"Bearer {token}"
+              req = urllib.request.Request(url, headers=headers)
+              with urllib.request.urlopen(req, timeout=45) as response:
+                  return response.read()
 
-          jq -r '
-            .tree[]
-            | select(.type == "tree")
-            | .path
-            | select(test("^(net|utils|admin|sound|multimedia|devel|libs|kernel|boot|base|packages)/[^/]+$"))
-            | split("/")[1]
-          ' /tmp/packages-tree.json > /tmp/openwrt_packages.txt
+          def get_repository_tree(repository):
+              metadata = json.loads(request(f"{API_ROOT}/{repository}"))
+              branch = urllib.parse.quote(metadata["default_branch"], safe="")
+              tree = json.loads(request(f"{API_ROOT}/{repository}/git/trees/{branch}?recursive=1"))
+              if tree.get("truncated"):
+                  raise RuntimeError(f"GitHub returned a truncated tree for {repository}; refusing to publish an incomplete list")
+              return metadata["default_branch"], tree["tree"]
 
-          jq -r '
-            .tree[]
-            | select(.type == "tree")
-            | .path
-            | select(test("^applications/[^/]+$"))
-            | split("/")[1]
-          ' /tmp/luci-tree.json >> /tmp/openwrt_packages.txt
+          trees = {}
+          for repository in REPOSITORIES:
+              branch, entries = get_repository_tree(repository)
+              trees[repository] = (branch, entries)
 
-          sort -u /tmp/openwrt_packages.txt > /tmp/packages_final.txt
+          packages = set()
+          makefiles = set()
 
-          if [[ ! -s /tmp/packages_final.txt ]]; then
-            echo "The package list is empty; refusing to update packages.json." >&2
-            exit 1
-          fi
+          # Every package feed category is included; do not maintain a short category allowlist.
+          for entry in trees["openwrt/packages"][1]:
+              parts = entry["path"].split("/")
+              if entry["type"] == "tree" and len(parts) == 2 and not parts[0].startswith("."):
+                  packages.add(parts[1])
+              if entry["type"] == "blob" and entry["path"].endswith("/Makefile"):
+                  makefiles.add(("openwrt/packages", entry["path"]))
 
-          echo "Found $(wc -l < /tmp/packages_final.txt | tr -d ' ') packages"
+          # LuCI packages also live outside applications (modules, protocols, themes, etc.).
+          for entry in trees["openwrt/luci"][1]:
+              parts = entry["path"].split("/")
+              if entry["type"] == "tree" and len(parts) == 2 and parts[0] in LUCI_PACKAGE_GROUPS:
+                  packages.add(parts[1])
+              if entry["type"] == "blob" and entry["path"].endswith("/Makefile"):
+                  makefiles.add(("openwrt/luci", entry["path"]))
 
-      - name: Generate packages.json
-        shell: bash
-        run: |
-          set -euo pipefail
-          GENERATED_AT="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          # Core packages and kernel modules (including kmod-* definitions) live in openwrt/openwrt.
+          for entry in trees["openwrt/openwrt"][1]:
+              path = entry["path"]
+              if entry["type"] != "blob":
+                  continue
+              if path.startswith("package/") and path.endswith("/Makefile"):
+                  makefiles.add(("openwrt/openwrt", path))
+              if path.endswith(".mk") and (
+                  path.startswith("package/kernel/linux/modules/")
+                  or (path.startswith("target/linux/") and "/modules/" in path)
+              ):
+                  makefiles.add(("openwrt/openwrt", path))
 
-          jq -Rn \
-            --arg generated_at "$GENERATED_AT" \
-            --arg source "https://github.com/openwrt/packages + https://github.com/openwrt/luci" \
-            '[inputs] as $packages | {generated_at: $generated_at, source: $source, packages: $packages}' \
-            /tmp/packages_final.txt > packages.json
+          def fetch_makefile(item):
+              repository, path = item
+              branch = urllib.parse.quote(trees[repository][0], safe="")
+              encoded_path = "/".join(urllib.parse.quote(part, safe="") for part in path.split("/"))
+              url = f"{RAW_ROOT}/{repository}/{branch}/{encoded_path}"
+              last_error = None
+              for attempt in range(3):
+                  try:
+                      return item, request(url, accept="text/plain").decode("utf-8", "replace")
+                  except Exception as error:
+                      last_error = error
+                      if attempt < 2:
+                          import time
+                          time.sleep(1 + attempt)
+              raise RuntimeError(f"Could not fetch {url}: {last_error}")
 
-          echo "Generated packages.json with $(jq '.packages | length' packages.json) packages"
+          # Parse package declarations instead of assuming one source directory equals one binary package.
+          with concurrent.futures.ThreadPoolExecutor(max_workers=24) as pool:
+              for (repository, path), source in pool.map(fetch_makefile, sorted(makefiles)):
+                  for name in PACKAGE_DEF.findall(source):
+                      if "$" not in name:
+                          packages.add(name)
+                  for name in BUILD_PACKAGE.findall(source):
+                      if "$" not in name:
+                          packages.add(name)
+                  for name in KERNEL_DEF.findall(source):
+                      if "$" not in name:
+                          packages.add(f"kmod-{name}")
+
+          packages = sorted(name for name in packages if name and not name.startswith("."))
+          if len(packages) < 1000:
+              raise RuntimeError(f"Only {len(packages)} package names were found; refusing to overwrite packages.json with an incomplete index")
+
+          document = {
+              "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+              "source": "https://github.com/openwrt/packages + https://github.com/openwrt/luci + https://github.com/openwrt/openwrt",
+              "packages": packages,
+          }
+          with open("packages.json", "w", encoding="utf-8") as output:
+              json.dump(document, output, ensure_ascii=False, indent=2)
+              output.write("\n")
+          print(f"Generated packages.json with {len(packages)} package names from {len(makefiles)} Makefiles")
+          print(f"Includes {sum(name.startswith('kmod-') for name in packages)} kernel module names")
+          PY
 
       - name: Commit and push if changed
-        shell: bash
         run: |
-          set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          if git diff --quiet -- packages.json; then
+          if git diff --quiet packages.json; then
             echo "No changes to packages.json"
           else
             git add packages.json
