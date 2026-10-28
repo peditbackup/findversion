@@ -33,9 +33,10 @@ jobs:
           API_ROOT = "https://api.github.com/repos"
           RAW_ROOT = "https://raw.githubusercontent.com"
           REPOSITORIES = ("openwrt/packages", "openwrt/luci", "openwrt/openwrt")
-          PACKAGE_DEF = re.compile(r"^\s*define\s+Package/([^\s/]+)\s*$", re.MULTILINE)
+          PACKAGE_DEF = re.compile(r"^\s*define\s+Package/([^\s/]+)(?:/Default)?\s*$", re.MULTILINE)
           KERNEL_DEF = re.compile(r"^\s*define\s+KernelPackage/([^\s/]+)\s*$", re.MULTILINE)
           BUILD_PACKAGE = re.compile(r"\$\(call\s+BuildPackage,([^\s)]+)\)")
+          PROVIDES_DEF = re.compile(r"^\s*PROVIDES\s*[:+?]?=\s*([^\\#\n]+)", re.MULTILINE)
           COREUTILS_APPLETS_DEF = re.compile(r"^\s*COREUTILS_APPLETS\s*[:+?]?=\s*(.*)$")
           LUCI_PACKAGE_GROUPS = {"applications", "collections", "libs", "modules", "plugins", "protocols", "themes"}
 
@@ -131,6 +132,8 @@ jobs:
                   for name in BUILD_PACKAGE.findall(source):
                       if "$" not in name:
                           packages.add(name)
+                  for provided_names in PROVIDES_DEF.findall(source):
+                      packages.update(name for name in provided_names.split() if "$" not in name)
                   for name in KERNEL_DEF.findall(source):
                       if "$" not in name:
                           packages.add(f"kmod-{name}")
