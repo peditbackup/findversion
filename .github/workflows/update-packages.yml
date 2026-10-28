@@ -1,0 +1,88 @@
+name: Update OpenWrt Packages List
+
+on:
+  schedule:
+    - cron: '0 3 1 */6 *' # January and July, on the 1st at 03:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  update-packages:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Fetch OpenWrt package directories
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          curl -fsSL "https://api.github.com/repos/openwrt/packages/git/trees/master?recursive=1" \
+            -o /tmp/packages-tree.json
+          curl -fsSL "https://api.github.com/repos/openwrt/luci/git/trees/master?recursive=1" \
+            -o /tmp/luci-tree.json
+
+          # GitHub can truncate large recursive trees; fail instead of writing a partial list.
+          if jq -e '.truncated == true' /tmp/packages-tree.json >/dev/null || \
+             jq -e '.truncated == true' /tmp/luci-tree.json >/dev/null; then
+            echo "GitHub returned a truncated repository tree." >&2
+            exit 1
+          fi
+
+          jq -r '
+            .tree[]
+            | select(.type == "tree")
+            | .path
+            | select(test("^(net|utils|admin|sound|multimedia|devel|libs|kernel|boot|base|packages)/[^/]+$"))
+            | split("/")[1]
+          ' /tmp/packages-tree.json > /tmp/openwrt_packages.txt
+
+          jq -r '
+            .tree[]
+            | select(.type == "tree")
+            | .path
+            | select(test("^applications/[^/]+$"))
+            | split("/")[1]
+          ' /tmp/luci-tree.json >> /tmp/openwrt_packages.txt
+
+          sort -u /tmp/openwrt_packages.txt > /tmp/packages_final.txt
+
+          if [[ ! -s /tmp/packages_final.txt ]]; then
+            echo "The package list is empty; refusing to update packages.json." >&2
+            exit 1
+          fi
+
+          echo "Found $(wc -l < /tmp/packages_final.txt | tr -d ' ') packages"
+
+      - name: Generate packages.json
+        shell: bash
+        run: |
+          set -euo pipefail
+          GENERATED_AT="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+
+          jq -Rn \
+            --arg generated_at "$GENERATED_AT" \
+            --arg source "https://github.com/openwrt/packages + https://github.com/openwrt/luci" \
+            '[inputs] as $packages | {generated_at: $generated_at, source: $source, packages: $packages}' \
+            /tmp/packages_final.txt > packages.json
+
+          echo "Generated packages.json with $(jq '.packages | length' packages.json) packages"
+
+      - name: Commit and push if changed
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if git diff --quiet -- packages.json; then
+            echo "No changes to packages.json"
+          else
+            git add packages.json
+            git commit -m "chore: update OpenWrt packages list ($(date -u +'%Y-%m-%d'))"
+            git push
+            echo "Pushed updated packages.json to project root"
+          fi
