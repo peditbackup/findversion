@@ -10,7 +10,7 @@
     {
       "id": "dual-boot-devices",
       "name": "Dual boot devices",
-      "packages": ["luci-app-advanced-boot", "nano", "curl"]
+      "packages": ["luci-app-advanced-reboot", "nano", "curl"]
     }
   ]
 }
